@@ -1,0 +1,6 @@
+# dsh-unicorn-background — DSH bundle patch.
+# Mounts one host entry; the host half serves the wallpaper and its client code,
+# and the client half (declared by `dsh.client` in package.json) injects the CSS.
+- insert:
+    - id: dsh-unicorn-background
+      name: dsh-unicorn-background

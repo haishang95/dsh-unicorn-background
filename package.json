@@ -1,0 +1,22 @@
+{
+  "name": "dsh-unicorn-background",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Paints a user-supplied image behind the DSH web interface (desktop and web profiles).",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web"
+    }
+  }
+}
