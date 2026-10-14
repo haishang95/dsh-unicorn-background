@@ -33,7 +33,26 @@
   var BUTTON_ID = "dsh-ub-button";
   var BUTTON_KEY = "dsh-user-background/button";
   var DEFAULTS_KEY = "dsh-user-background/defaults";
+  var BAND_KEY = "dsh-user-background/band";
   var LEGACY_POSITION_KEY = "dsh-user-background/position";
+
+  /**
+   * The reading-band glass sits between the two draggable conversation
+   * boundaries. It is deliberately kept in localStorage rather than the host
+   * config: the host half cannot hot-reload, so adding config keys would make
+   * the whole feature wait for a restart. It defaults to off, so the existing
+   * column frost keeps working exactly as before.
+   */
+  var BAND_FACTORY = { enabled: false, width: 100, opacity: 58, blur: 20, color: "", base: 2 };
+
+  /**
+   * Width is a percentage of the text column, but 100% is re-based to the width
+   * the user settled on (105% of the column) — so the slider reads 100% for their
+   * preferred look, and every stored reading from the older, un-based scale is
+   * divided by this factor once (see readBand), leaving the drawn width unchanged.
+   */
+  var BAND_BASE = 1.05;
+  var BAND_BASE_LEVEL = 2;
 
   /**
    * What "恢复默认" restores. FACTORY is the shipped baseline; "设为默认" records
@@ -65,6 +84,7 @@
     listeners: null,
     namedImage: false,
     userDefaults: null,
+    band: null,
   };
 
   // ---------------------------------------------------------------- utilities
@@ -289,6 +309,19 @@
       + "-webkit-backdrop-filter:" + backdrop + " !important;";
   }
 
+  /**
+   * Tint without a backdrop-filter.
+   *
+   * A `backdrop-filter` on an element makes that element the backdrop root for its
+   * descendants, so a frosted layer inside it can only blur what is painted within
+   * it. The conversation column therefore drops its own filter whenever the reading
+   * band is on: otherwise the column — even at `blur(0px)`, which paints nothing —
+   * would shadow the band's blur completely.
+   */
+  function tint(fill, percent) {
+    return "background:" + veil(fill, percent) + " !important;";
+  }
+
   function imageSource(config) {
     const name = config.image || "default";
     // Per-name addressing skips the save race entirely: the sheet points at the
@@ -318,6 +351,194 @@
     return "";
   }
 
+  // ------------------------------------------------------------- reading band
+
+  /** Resolve any CSS colour — including color-mix() — to #rrggbb through a 1px canvas. */
+  function resolveColor(value, fallback) {
+    try {
+      var canvas = document.createElement("canvas");
+      canvas.width = 1;
+      canvas.height = 1;
+      var ctx = canvas.getContext("2d");
+      if (!ctx) return fallback;
+      ctx.fillStyle = "#000000";
+      ctx.fillStyle = value;
+      ctx.fillRect(0, 0, 1, 1);
+      var data = ctx.getImageData(0, 0, 1, 1).data;
+      return "#" + [data[0], data[1], data[2]]
+        .map(function (channel) { return ("0" + channel.toString(16)).slice(-2); })
+        .join("");
+    } catch (error) {
+      return fallback;
+    }
+  }
+
+  function readBand() {
+    var values = Object.assign({}, BAND_FACTORY);
+    var stored = null;
+    try {
+      var raw = localStorage.getItem(BAND_KEY);
+      if (raw) stored = JSON.parse(raw);
+    } catch (error) {
+      /* a blocked or corrupt store falls back to the shipped defaults */
+    }
+    if (stored) Object.assign(values, stored);
+    // Decide on the STORED object, not the merged one: the factory already carries
+    // the marker, so a merged check could never see that an old entry lacks it.
+    if (stored && stored.base !== BAND_BASE_LEVEL) {
+      var previous = Number(values.width);
+      if (isFinite(previous) && previous > 0) {
+        values.width = Math.round((previous / BAND_BASE) * 100) / 100;
+      }
+      values.base = BAND_BASE_LEVEL;
+      try {
+        localStorage.setItem(BAND_KEY, JSON.stringify(values));
+      } catch (error) {
+        /* the migration still applies for this session */
+      }
+    }
+    return values;
+  }
+
+  function writeBand() {
+    try {
+      localStorage.setItem(BAND_KEY, JSON.stringify(state.band));
+    } catch (error) {
+      /* the setting still applies for this session */
+    }
+  }
+
+  /** The band's colour: the user's pick (typed or extracted), or the theme's surface colour. */
+  function bandFill(theme) {
+    var picked = state.band && state.band.color;
+    return picked && picked !== "" ? picked : theme.layer1;
+  }
+
+  function toHex(red, green, blue) {
+    return "#" + [red, green, blue]
+      .map(function (channel) {
+        var value = Math.max(0, Math.min(255, Math.round(channel)));
+        return ("0" + value.toString(16)).slice(-2);
+      })
+      .join("");
+  }
+
+  /**
+   * The wallpaper's colour for the band.
+   *
+   * The most *frequent* bucket is usually the paper field, which tints the glass
+   * almost white — indistinguishable from "follow the theme". So among the buckets
+   * that hold a meaningful share of the image, the most saturated one wins: the
+   * result reads as a colour, and it still comes from the picture itself.
+   */
+  function dominantColor(data) {
+    var buckets = new Map();
+    for (var i = 0; i < data.length; i += 4) {
+      var r = data[i];
+      var g = data[i + 1];
+      var b = data[i + 2];
+      if (data[i + 3] < 200) continue;
+      var high = Math.max(r, g, b);
+      var low = Math.min(r, g, b);
+      if (high < 24) continue;
+      if (high > 244 && high - low < 12) continue;
+      var key = ((r >> 5) << 10) | ((g >> 5) << 5) | (b >> 5);
+      var entry = buckets.get(key);
+      if (entry === undefined) buckets.set(key, { count: 1, r: r, g: g, b: b });
+      else {
+        entry.count += 1;
+        entry.r += r;
+        entry.g += g;
+        entry.b += b;
+      }
+    }
+    var entries = [];
+    buckets.forEach(function (entry) {
+      entry.avg = { r: entry.r / entry.count, g: entry.g / entry.count, b: entry.b / entry.count };
+      var top = Math.max(entry.avg.r, entry.avg.g, entry.avg.b);
+      var bottom = Math.min(entry.avg.r, entry.avg.g, entry.avg.b);
+      entry.saturation = top === 0 ? 0 : (top - bottom) / top;
+      entries.push(entry);
+    });
+    if (entries.length === 0) return "";
+    var most = entries[0];
+    entries.forEach(function (entry) {
+      if (entry.count > most.count) most = entry;
+    });
+    var floor = most.count * 0.25;
+    var pick = most;
+    entries.forEach(function (entry) {
+      if (entry.count < floor) return;
+      if (entry.saturation > pick.saturation) pick = entry;
+    });
+    return toHex(pick.avg.r, pick.avg.g, pick.avg.b);
+  }
+
+  /**
+   * Sample the wallpaper down to a small canvas and take its dominant colour.
+   * Same-origin, so the canvas is readable; anything unexpected falls back to "".
+   */
+  function sampleWallpaper(source, done) {
+    var image = new Image();
+    var size = 48;
+    image.onload = function () {
+      try {
+        var canvas = document.createElement("canvas");
+        canvas.width = size;
+        canvas.height = size;
+        var ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) {
+          done("");
+          return;
+        }
+        ctx.drawImage(image, 0, 0, size, size);
+        done(dominantColor(ctx.getImageData(0, 0, size, size).data));
+      } catch (error) {
+        done("");
+      }
+    };
+    image.onerror = function () {
+      done("");
+    };
+    image.src = source;
+  }
+
+  function bandOn() {
+    return state.band !== null && state.band.enabled === true;
+  }
+
+  /**
+   * The reading band, drawn between the two draggable conversation boundaries.
+   *
+   * DSH sizes the message column with `xz4KEq_column{max-width:var(--dsh-chat-content-width);
+   * margin:0 auto}`, and the width handles write that same variable on the column's
+   * container. So a pseudo-element on the chat frame — the nearest positioned,
+   * container-query ancestor that inherits the variable — reproduces the band exactly:
+   * `left:calc(50% - width/2)` puts it where the column sits, and it resizes with the
+   * drag without any script measuring anything.
+   *
+   * The frame is identified by having a `_root` child, which the layout frame
+   * (whose children are columns) does not.
+   */
+  function bandRule(theme, config) {
+    var band = state.band;
+    if (!band || band.enabled !== true) return "";
+    var backdrop = "blur(" + clamp(band.blur, 0, 60) + "px) saturate(" + clamp(config.saturate, 0, 300) + "%)";
+    // Width is a percentage on the user's own scale: 100% is their baseline, which
+    // BAND_BASE relates to the text column, and every value still scales with the
+    // two boundaries as they are dragged.
+    var scale = clamp(band.width === undefined ? 100 : band.width, 10, 150) / 100 * BAND_BASE;
+    var full = "var(--dsh-chat-content-width, 748px) * " + scale;
+    var half = "var(--dsh-chat-content-width, 748px) * " + scale / 2;
+    return '[class*="_frame"]:has(> [class*="_root"])::before{content:"";position:absolute;'
+      + "top:0;bottom:0;pointer-events:none;"
+      + "left:calc(50% - " + half + ");"
+      + "width:calc(" + full + ");"
+      + "background:" + veil(bandFill(theme), band.opacity) + " !important;"
+      + "backdrop-filter:" + backdrop + " !important;"
+      + "-webkit-backdrop-filter:" + backdrop + " !important;}";
+  }
+
   function sheet() {
     var config = state.config;
     var theme = state.originals || readOriginals();
@@ -325,6 +546,10 @@
     var layer2 = Math.min(100, panel + 10);
     var layer3 = Math.min(100, panel + 16);
     var glassArgs = [config.blur, config.saturate];
+    // With the band on, the conversation column must not become a backdrop root.
+    var centerFill = bandOn()
+      ? tint(theme.layer1, config.center)
+      : glass(theme.layer1, config.center, glassArgs[0], glassArgs[1]);
     return [
       ':root{background-image:url("' + imageSource(config) + '") !important;',
       "background-position:center center !important;",
@@ -339,10 +564,12 @@
       "--dsw-alias-bg-layer-3:" + veil(theme.layer3, layer3) + " !important;}",
       // Column classes are CSS-module hashes; the local name is the stable half.
       '[class*="_sidebarCol"]{' + glass(theme.sidebarFill, config.sidebar, glassArgs[0], glassArgs[1]) + "}",
-      '[class*="_centerCol"]{' + glass(theme.layer1, config.center, glassArgs[0], glassArgs[1]) + "}",
+      '[class*="_centerCol"]{' + centerFill + "}",
       '[class*="_rightbarCol"]{' + glass(theme.layer1, config.center, glassArgs[0], glassArgs[1]) + "}",
       // The Windows titlebar strip belongs to the frame, not to a column.
       '[class*="_frame"]:before{' + glass(theme.sidebarFill, config.sidebar, glassArgs[0], glassArgs[1]) + "}",
+      // Optional reading band between the two draggable conversation boundaries.
+      bandRule(theme, config),
     ].join("");
   }
 
@@ -363,6 +590,8 @@
     document.head.appendChild(state.styleEl);
     window.__dshUserBackgroundApplied = true;
     state.painted += 1;
+    // A theme change moves the band's inherited colour, so the swatch follows.
+    if (reread) syncBand();
     report();
     return true;
   }
@@ -375,10 +604,45 @@
     }, 40);
   }
 
+  /**
+   * Which ancestors would confine a backdrop-filter. A `backdrop-filter` on an
+   * ancestor makes that element the backdrop root, so a descendant's own
+   * backdrop-filter can then only blur what is painted inside it — which is why
+   * a frosted layer can look like it is doing nothing.
+   */
+  function backdropBlockers(node) {
+    var found = [];
+    var current = node;
+    var depth = 0;
+    while (current && depth < 16) {
+      var style;
+      try {
+        style = getComputedStyle(current);
+      } catch (error) {
+        break;
+      }
+      var cls = typeof current.className === "string" ? current.className.trim().split(/\s+/)[0] : "";
+      var reasons = [];
+      if (style.backdropFilter && style.backdropFilter !== "none") reasons.push("backdrop:" + style.backdropFilter);
+      if (style.filter && style.filter !== "none") reasons.push("filter:" + style.filter);
+      if (parseFloat(style.opacity) < 1) reasons.push("opacity:" + style.opacity);
+      if (style.contain && /paint/.test(style.contain)) reasons.push("contain:paint");
+      if (reasons.length > 0) {
+        found.push((current.tagName.toLowerCase() + "." + cls).slice(0, 28) + "[" + reasons.join(" ") + "]");
+      }
+      current = current.parentElement;
+      depth += 1;
+    }
+    return found.length === 0 ? "none" : found.join(" < ");
+  }
+
   function report() {
     try {
       var sidebar = document.querySelector('[class*="_sidebarCol"]');
       var center = document.querySelector('[class*="_centerCol"]');
+      var chatFrame = document.querySelector('[class*="_frame"]:has(> [class*="_root"])');
+      var band = state.band || {};
+      var bandBefore = chatFrame ? getComputedStyle(chatFrame, "::before") : null;
       var payload = [
         "applied=" + state.painted,
         "enabled=" + (state.config.enabled === false ? "0" : "1"),
@@ -388,6 +652,16 @@
         "scheme=" + (document.body.hasAttribute("data-ds-dark-theme") ? "dark" : "light"),
         "sidebar=" + (sidebar ? getComputedStyle(sidebar).backgroundColor + "|" + getComputedStyle(sidebar).backdropFilter : "absent"),
         "center=" + (center ? getComputedStyle(center).backgroundColor + "|" + getComputedStyle(center).backdropFilter : "absent"),
+        "band=" + (band.enabled === true ? "on" : "off") + ":w" + (band.width === undefined ? 100 : band.width) + ":o" + band.opacity + ":" + (band.color || "theme") + ":" + band.blur,
+        "bandFrame=" + (chatFrame ? "found" : "missing"),
+        "bandVar=" + (chatFrame ? String(getComputedStyle(chatFrame).getPropertyValue("--dsh-chat-content-width")).trim() || "unset" : "-"),
+        "frameRect=" + (chatFrame
+          ? Math.round(chatFrame.getBoundingClientRect().width) + "x" + Math.round(chatFrame.getBoundingClientRect().height)
+          : "-"),
+        "bandBox=" + (bandBefore
+          ? [bandBefore.content, bandBefore.left, bandBefore.width, bandBefore.backgroundColor, bandBefore.backdropFilter].join("|")
+          : "-"),
+        "bandBlockers=" + (chatFrame ? backdropBlockers(chatFrame) : "-"),
       ].join(" ");
       var request = fetch(API + "/state?report=" + encodeURIComponent(payload), { cache: "no-store" });
       if (request && typeof request.catch === "function") request.catch(function () {});
@@ -569,6 +843,10 @@
     ".dsh-ub-anchor[data-active='1']{border-color:var(--dsh-ub-accent);color:var(--dsh-ub-accent)}",
     ".dsh-ub-foot{display:flex;align-items:center;gap:8px;margin-top:14px}",
     ".dsh-ub-status{flex:1;font-size:11.5px;opacity:.6;text-align:right;min-height:14px}",
+    ".dsh-ub-color{width:34px;height:22px;padding:0;border:.5px solid var(--dsh-ub-line);",
+    "border-radius:6px;background:var(--dsh-ub-control);cursor:pointer;flex:none}",
+    ".dsh-ub-extract{margin-left:auto;font-size:11.5px;padding:4px 9px}",
+    ".dsh-ub-extract:disabled{opacity:.5;cursor:default}",
   ].join("");
 
   var ICON = '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
@@ -612,6 +890,53 @@
     var patch = {};
     patch[key] = value;
     return patch;
+  }
+
+  // ----------------------------------------------------- reading-band controls
+
+  /** A slider bound to `state.band` rather than the host config. */
+  function bandSlider(label, key, min, max, unit) {
+    var row = make("div", "dsh-ub-row");
+    row.appendChild(make("div", "dsh-ub-label", label));
+    var input = document.createElement("input");
+    input.type = "range";
+    input.className = "dsh-ub-range";
+    input.min = String(min);
+    input.max = String(max);
+    input.step = "1";
+    var value = make("div", "dsh-ub-value", "");
+    row.appendChild(input);
+    row.appendChild(value);
+    input.addEventListener("input", function () {
+      // No syncBand() here: writing back into a range input mid-drag breaks the gesture.
+      state.band[key] = clamp(input.value, min, max);
+      value.textContent = input.value + unit;
+      paint(false);
+      writeBand();
+    });
+    return { row: row, input: input, value: value, unit: unit, key: key };
+  }
+
+  /** Apply a discrete band change: repaint, persist, and refresh the controls. */
+  function applyBand() {
+    paint(false);
+    writeBand();
+    syncBand();
+  }
+
+  function syncBand() {
+    var controls = state.controls;
+    if (!controls || !controls.band || !state.band) return;
+    var band = state.band;
+    var theme = state.originals || readOriginals();
+    controls.band.enabled.checked = band.enabled === true;
+    controls.band.width.input.value = String(band.width === undefined ? 100 : band.width);
+    controls.band.width.value.textContent = (band.width === undefined ? 100 : band.width) + "%";
+    controls.band.opacity.input.value = String(band.opacity);
+    controls.band.opacity.value.textContent = band.opacity + "%";
+    controls.band.blur.input.value = String(band.blur);
+    controls.band.blur.value.textContent = band.blur + "px";
+    controls.band.color.value = resolveColor(bandFill(theme), "#ffffff");
   }
 
   function mountPanel() {
@@ -688,6 +1013,69 @@
     panel.appendChild(content.row);
     panel.appendChild(blur.row);
 
+    // The explanation lives in the tooltip rather than a paragraph, so the panel stays compact.
+    var bandSection = make("div", "dsh-ub-section", "文字区毛玻璃带");
+    bandSection.title = "在对话的左右两条可拉伸边界之间铺一层毛玻璃，宽度随拖动自动变化；带子宽度以文字列为基准。启用后对话栏只保留底色、不再叠自己的背景模糊，否则那一层会把这里的毛玻璃整片遮掉——想只磨砂文字区，把上面的「对话栏」拉到 0%。";
+    panel.appendChild(bandSection);
+
+    var bandToggleRow = make("div", "dsh-ub-row");
+    var bandToggleLabel = make("label", "dsh-ub-label");
+    bandToggleLabel.style.flex = "1";
+    bandToggleLabel.style.display = "flex";
+    bandToggleLabel.style.alignItems = "center";
+    bandToggleLabel.style.gap = "7px";
+    var bandEnabled = document.createElement("input");
+    bandEnabled.type = "checkbox";
+    bandToggleLabel.appendChild(bandEnabled);
+    bandToggleLabel.appendChild(make("span", null, "启用"));
+    bandToggleRow.appendChild(bandToggleLabel);
+    panel.appendChild(bandToggleRow);
+
+    var bandWidth = bandSlider("带子宽度", "width", 20, 150, "%");
+    var bandOpacity = bandSlider("不透明度", "opacity", 0, 100, "%");
+    var bandBlur = bandSlider("毛玻璃模糊", "blur", 0, 60, "px");
+    panel.appendChild(bandWidth.row);
+    panel.appendChild(bandOpacity.row);
+    panel.appendChild(bandBlur.row);
+
+    var bandColorRow = make("div", "dsh-ub-row");
+    bandColorRow.appendChild(make("div", "dsh-ub-label", "玻璃颜色"));
+    var bandColor = document.createElement("input");
+    bandColor.type = "color";
+    bandColor.className = "dsh-ub-color";
+    bandColor.title = "毛玻璃底色";
+    bandColorRow.appendChild(bandColor);
+    // A one-shot action, not a mode: it samples the wallpaper and writes the result
+    // into the colour beside it, which the user can then keep or adjust.
+    var bandExtract = make("button", "dsh-ub-btn dsh-ub-extract", "从背景中提取");
+    bandExtract.title = "采样当前背景图的主色调，写入左边的玻璃颜色";
+    bandColorRow.appendChild(bandExtract);
+    panel.appendChild(bandColorRow);
+
+    bandEnabled.addEventListener("change", function () {
+      state.band.enabled = bandEnabled.checked;
+      applyBand();
+    });
+    bandColor.addEventListener("input", function () {
+      state.band.color = bandColor.value;
+      applyBand();
+    });
+    bandExtract.addEventListener("click", function () {
+      if (bandExtract.disabled) return;
+      bandExtract.disabled = true;
+      setStatus("提取中…");
+      sampleWallpaper(imageSource(state.config), function (color) {
+        bandExtract.disabled = false;
+        if (!color) {
+          setStatus("提取失败，请手动选色");
+          return;
+        }
+        state.band.color = color;
+        applyBand();
+        setStatus("已提取 " + color);
+      });
+    });
+
     panel.appendChild(make("div", "dsh-ub-section", "按钮位置（也可直接拖动图标）"));
     var anchors = make("div", "dsh-ub-anchors");
     var anchorButtons = [];
@@ -759,6 +1147,13 @@
       blur: blur,
       anchors: anchorButtons,
       status: status,
+      band: {
+        enabled: bandEnabled,
+        width: bandWidth,
+        opacity: bandOpacity,
+        blur: bandBlur,
+        color: bandColor,
+      },
     };
   }
 
@@ -868,6 +1263,8 @@
   function bootstrap() {
     // Before load(): it fills missing config keys from the active baseline.
     state.userDefaults = readUserDefaults();
+    // Before mountPanel(): its controls bind straight to this object.
+    state.band = readBand();
     load().then(function () {
       try {
         mountPanel();
@@ -880,6 +1277,7 @@
         state.button = readButtonPoint();
         place();
         sync();
+        syncBand();
       } catch (error) {
         fail("panel", error);
       }
